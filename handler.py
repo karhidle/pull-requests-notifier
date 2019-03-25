@@ -36,12 +36,9 @@ def check_pending_pull_requests(event: dict, context) -> dict:
     Checks pending pull requests and sends a notification
 
     """
+    # GraphQL query to get open pulls within an organization.
+    # For now only parsing top 100 pulls, and most recent reviews.
 
-    ssm_parameters = load_params('dev_tools', 'dev')
-
-    # GraphQL query that gets all OPEN pull requests for each repo within an organization
-    # @todo: fix hardcoded pagination
-    
     query = '''
 {
   organization(login: "github_organization") {
@@ -103,24 +100,29 @@ def check_pending_pull_requests(event: dict, context) -> dict:
   }
 }
 '''
+    # load configuration from the parameter store
+    ssm_parameters = load_params('dev_tools', 'dev')
 
+    # get pulls from github
     headers = {"Authorization": f"token {ssm_parameters['github_access_token']}"}
     result = requests.post('https://api.github.com/graphql',
                            json={'query': query.replace('github_organization', ssm_parameters['github_organization'])},
                            headers=headers)
 
-    if result.status_code == 200:
-        data = result.json()
-    else:
-        raise Exception(f'Query failed to run by returning code of {result.status_code}. {query}')
+    if result.status_code != 200:
+        logging.error(f"Github's API returned code {result.status_code} for query: {query}")
+        return
 
-    if not data['data']['organization']:
+    data = result.json()
+    if not data or not ['data']['organization']:
         return {}
 
-    # for all repos, check if there are OPEN pull requests and get relevant info about the status.
+    # parse results and create slack message for notification
     message = ''
     for repository in data['data']['organization']['repositories']['edges']:
+
         repository_name = repository['node']['name']
+
         if repository['node']['pullRequests']['totalCount'] > 0:
 
             for pull_node in repository['node']['pullRequests']['edges']:
@@ -129,17 +131,15 @@ def check_pending_pull_requests(event: dict, context) -> dict:
 
                 # figure out the time that has passed since the pull request was created
                 now = datetime.datetime.utcnow()
-
                 created = datetime.datetime.strptime(pull['createdAt'], '%Y-%m-%dT%H:%M:%SZ')
-
                 time_diff = (now - created)
 
                 if time_diff.days:
                     time_since_created = f"{time_diff.days} day{'' if time_diff.days == 1 else 's'} ago"
-                    # add warning emojis for old pull requests
-                    if 2 < time_diff.days < 5:
+                    # add warnings for old pull requests
+                    if 3 < time_diff.days < 6:
                         time_since_created += ' :warning:'
-                    elif time_diff.days >= 5:
+                    elif time_diff.days >= 6:
                         time_since_created += ' :fire:'
                 else:
                     due_hours = int(time_diff.seconds / 3600)
