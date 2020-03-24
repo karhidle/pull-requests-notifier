@@ -31,7 +31,7 @@ def load_params(namespace: str, env: str, region_name: str = 'us-east-1') -> dic
     return config
 
 
-def check_pending_pull_requests(event: dict, context) -> dict:
+def check_open_pull_requests(event: dict, context) -> dict:
     """
     Checks pending pull requests and sends a notification
 
@@ -41,56 +41,51 @@ def check_pending_pull_requests(event: dict, context) -> dict:
 
     query = '''
 {
-  organization(login: "github_organization") {
-    repositories(first: 100) {
-      totalCount,
-      edges {
-        node {
-          name
-          pullRequests(first: 20, states: OPEN) {
-            totalCount,
+  search(query: "org:github_organization is:pr state:open", type: ISSUE, first: 100) {
+    edges {
+      node {
+        ... on PullRequest {
+          url
+          title
+          createdAt
+          author {
+            login
+          }
+          repository {
+            name
+          }
+          assignees(first: 10) {
+            totalCount
             edges {
               node {
-                reviewRequests(first: 20) {
-                  totalCount
-                  edges {
-                    node {
-                      requestedReviewer {
-                        __typename
-                        ... on User {
-                          login
-                        }
-                        ... on Team {
-                          name
-                        }                        
-                      }
-                    }
+                login
+              }
+            }
+          }
+          reviewRequests(first: 20) {
+            totalCount
+            edges {
+              node {
+                requestedReviewer {
+                  __typename
+                  ... on User {
+                    login
+                  }
+                  ... on Team {
+                    name
                   }
                 }
-                title,
-                createdAt
-                url,
+              }
+            }
+          }
+          reviews(first: 20) {
+            totalCount
+            edges {
+              node {
                 author {
                   login
-                },
-                assignees(first: 10) {
-                  totalCount,
-                  edges {
-                    node {
-                      login
-                    }
-                  }                  
-                },
-                reviews(first: 20) {
-                  totalCount
-                  edges {
-                    node {
-                      author {
-                        login
-                      }
-                    }
-                  }
                 }
+                state
               }
             }
           }
@@ -102,6 +97,7 @@ def check_pending_pull_requests(event: dict, context) -> dict:
 '''
     # load configuration from the parameter store
     ssm_parameters = load_params('dev_tools', 'dev')
+    skip_repositories = ssm_parameters['pr_skip_repositories'] if 'pr_skip_repositories' in ssm_parameters else ()
 
     # get pulls from github
     headers = {"Authorization": f"token {ssm_parameters['github_access_token']}"}
@@ -114,53 +110,85 @@ def check_pending_pull_requests(event: dict, context) -> dict:
         return
 
     data = result.json()
-    if not data or not ['data']['organization']:
+    if not data or not data.get('data'):
+        logging.error(f"Github's API returned invalid data: {data}")
         return {}
 
     # parse results and create slack message for notification
     message = ''
-    for repository in data['data']['organization']['repositories']['edges']:
+    for pr_node in data['data']['search']['edges']:
 
-        repository_name = repository['node']['name']
+        pr = pr_node['node']
+        repository_name = pr['repository']['name']
 
-        if repository['node']['pullRequests']['totalCount'] > 0:
+        if repository_name in skip_repositories:
+            continue
 
-            for pull_node in repository['node']['pullRequests']['edges']:
+        # figure out the time that has passed since the pull request was created
+        now = datetime.datetime.utcnow()
+        created = datetime.datetime.strptime(pr['createdAt'], '%Y-%m-%dT%H:%M:%SZ')
+        time_diff = (now - created)
 
-                pull = pull_node['node']
+        if time_diff.days:
+            time_since_created = f"{time_diff.days} day{'' if time_diff.days == 1 else 's'} ago"
+            # add warnings for old pull requests
+            if 3 < time_diff.days < 6:
+                time_since_created += ' :warning:'
+            elif time_diff.days >= 6:
+                time_since_created += ' :fire:'
+        else:
+            due_hours = int(time_diff.seconds / 3600)
+            if due_hours:
+                time_since_created = f"{due_hours} hour{'' if due_hours == 1 else 's'} ago"
+            else:
+                minutes_ago = int(time_diff.seconds / 60)
+                time_since_created = f"{minutes_ago} minute{'' if minutes_ago == 1 else 's'} ago"
 
-                # figure out the time that has passed since the pull request was created
-                now = datetime.datetime.utcnow()
-                created = datetime.datetime.strptime(pull['createdAt'], '%Y-%m-%dT%H:%M:%SZ')
-                time_diff = (now - created)
+        # pull request summary for the message
+        message += f" Repository: {repository_name}."
+        message += f" Pull: {pr['title']}.\n"
+        message += f" URL: {pr['url']}.\n"
 
-                if time_diff.days:
-                    time_since_created = f"{time_diff.days} day{'' if time_diff.days == 1 else 's'} ago"
-                    # add warnings for old pull requests
-                    if 3 < time_diff.days < 6:
-                        time_since_created += ' :warning:'
-                    elif time_diff.days >= 6:
-                        time_since_created += ' :fire:'
-                else:
-                    due_hours = int(time_diff.seconds / 3600)
-                    if due_hours:
-                        time_since_created = f"{due_hours} hour{'' if due_hours == 1 else 's'} ago"
-                    else:
-                        minutes_ago = int(time_diff.seconds / 60)
-                        time_since_created = f"{minutes_ago} minute{'' if minutes_ago == 1 else 's'} ago"
+        # collect activity
+        activity = {'APPROVED': 0,
+                    'CHANGES_REQUESTED': 0,
+                    'COMMENTED': 0,
+                    'DISMISSED': 0,
+                    'PENDING': 0}
 
-                # pull request summary for the message
-                message += f" Repository: {repository_name}."
-                message += f" Pull: {pull['title']}.\n"
-                message += f" URL: {pull['url']}.\n"
-                message += f" Author: {pull['author']['login']}. Created: {time_since_created}\n"
-                message += f" Reviews: {pull['reviews']['totalCount']}, "
-                message += f" pending {pull['reviewRequests']['totalCount']}.\n\n"
+        if pr['reviews']['totalCount'] > 0:
+            for review_node in pr['reviews']['edges']:
+                activity[review_node['node']['state']] += 1
+
+            if activity['CHANGES_REQUESTED']:
+                message += f" :changes_requested: Changes requested, completion may take some time.\n"
+
+        message += f" Author: {pr['author']['login']}. Created: {time_since_created}\n"
+
+        if pr['reviewRequests']['totalCount']:
+            message += f" Reviewers: {pr['reviewRequests']['totalCount']} pending.\n"
+        else:
+            message += " No pending reviewers.\n"
+
+        activity_msg = ''
+        if activity['APPROVED']:
+            activity_msg += f"{activity['APPROVED']} approval{'' if activity['APPROVED'] == 1 else 's'}"
+
+        if activity['COMMENTED']:
+            activity_msg += f", {activity['COMMENTED']} comment{'' if activity['COMMENTED'] == 1 else 's'}"
+
+        if activity['DISMISSED']:
+            activity_msg += f", {activity['DISMISSED']} dismissed approval{'' if activity['DISMISSED'] == 1 else 's'}"
+
+        if activity_msg:
+            message += f" Activity: {activity_msg}.\n"
+
+        message += "\n"
 
     if message:
         # send notification via slack
         slack_headers = {'Content-type': 'application/json',
-                         'Authorization': f"Bearer {ssm_parameters['slack_token']}"}
+                         'Authorization': f"Bearer {ssm_parameters['slack_access_token']}"}
 
         r = requests.post(url=ssm_parameters['slack_webhook_url'],
                           headers=slack_headers,
