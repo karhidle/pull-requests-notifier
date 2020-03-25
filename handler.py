@@ -114,6 +114,11 @@ def check_open_pull_requests(event: dict, context) -> dict:
         logging.error(f"Github's API returned invalid data: {data}")
         return {}
 
+    action_labels = {
+        'APPROVED': 'approval',
+        'COMMENTED': 'comment',
+        'DISMISSED': 'dismissed approval'
+    }
     # parse results and create slack message for notification
     message = ''
     for pr_node in data['data']['search']['edges']:
@@ -171,19 +176,14 @@ def check_open_pull_requests(event: dict, context) -> dict:
             message += " No pending reviewers.\n"
 
         activity_msg = ''
-        if activity['APPROVED']:
-            activity_msg += f"{activity['APPROVED']} approval{'' if activity['APPROVED'] == 1 else 's'}"
-
-        if activity['COMMENTED']:
-            activity_msg += f", {activity['COMMENTED']} comment{'' if activity['COMMENTED'] == 1 else 's'}"
-
-        if activity['DISMISSED']:
-            activity_msg += f", {activity['DISMISSED']} dismissed approval{'' if activity['DISMISSED'] == 1 else 's'}"
+        for action in ('APPROVED', 'COMMENTED', 'DISMISSED'):
+            if activity[action]:
+                if activity_msg:
+                    activity_msg += ", "
+                activity_msg += f"{activity[action]} {action_labels[action]}{'' if activity[action] == 1 else 's'}"
 
         if activity_msg:
             message += f" Activity: {activity_msg}.\n"
-
-        message += "\n"
 
     if message:
         # send notification via slack
@@ -192,7 +192,7 @@ def check_open_pull_requests(event: dict, context) -> dict:
 
         r = requests.post(url=ssm_parameters['slack_webhook_url'],
                           headers=slack_headers,
-                          data=json.dumps({'text': f'The following pull requests are OPEN:\n\n{message}'}))
+                          data=json.dumps({'text': f'The following pull requests are OPEN:\n\n{message}\n'}))
 
         if r.status_code != 200:
             logging.error(f'Got status {r.status_code} while trying to post to the slack webhook url.')
